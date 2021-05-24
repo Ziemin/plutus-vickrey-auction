@@ -1,0 +1,8 @@
+cradle:
+  cabal:
+    - path: "./src"
+      component: "lib:vickrey-auction"
+    - path: "./app"
+      component: "exe:auction-pab"
+    - path: "./app"
+      component: "exe:auction-client"
