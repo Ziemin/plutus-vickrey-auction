@@ -34,10 +34,11 @@ import           Plutus.Contract.StateMachine
 -- import           Plutus.Contracts.Currency    as Currency
 import qualified PlutusTx
 import qualified PlutusTx.AssocMap            as AssocMap
+import qualified PlutusTx.List                as List
 import           PlutusTx.Prelude             hiding (Semigroup (..), unless)
 -- import           PlutusTx.Ord                 (Ord, compare)
 import           Prelude                      (Semigroup (..))
-import qualified Prelude
+import qualified Prelude                      hiding (head, max, tail)
 
 
 data BsDigits = BsDigits
@@ -52,11 +53,11 @@ data BsDigits = BsDigits
   , bs8     :: ByteString
   , bs9     :: ByteString
   , bsOther :: ByteString
+  , bsMinus :: ByteString
   }
   deriving stock (Show, Generic, Prelude.Eq)
   deriving anyclass (ToJSON, FromJSON)
 
-PlutusTx.unstableMakeIsData ''BsDigits
 PlutusTx.makeLift ''BsDigits
 
 bsDigits :: BsDigits
@@ -72,11 +73,15 @@ bsDigits = BsDigits
   , bs8 = "8"
   , bs9 = "9"
   , bsOther = "?"
+  , bsMinus = "-"
   }
 
 {-# INLINABLE encodeInteger #-}
 encodeInteger :: Integer -> BsDigits -> ByteString
-encodeInteger val digits = if val == 0 then bs0 digits else encodeInteger' val
+encodeInteger val digits
+  | val == 0  = bs0 digits
+  | val > 0   = encodeInteger' val
+  | otherwise = bsMinus digits `concatenate` encodeInteger' (negate val)
   where
     encodeDigit :: Integer -> ByteString
     encodeDigit d
@@ -119,24 +124,16 @@ PlutusTx.makeLift ''AuctionParams
 type SealedBids = AssocMap.Map PubKeyHash ByteString
 type OpenBids = AssocMap.Map PubKeyHash Ada
 
-newtype PkBid = PkBid { getBid :: (PubKeyHash, Ada) }
-  deriving stock (Show, Generic, Prelude.Eq)
-  deriving newtype (Eq)
-  deriving anyclass (ToJSON, FromJSON)
-
-instance Ord PkBid where
-  {-# INLINEABLE compare #-}
-  bid1 `compare` bid2 = snd (getBid bid1) `compare` snd (getBid bid2)
-
 
 data AuctionState
   = Initializing
   | Collecting SealedBids
   | Revealing SealedBids OpenBids
   | Claiming
-    { winner    :: !PubKeyHash,
-      price     :: !PubKeyHash,
-      unclaimed :: ![PubKeyHash]
+    { winner     :: !PubKeyHash
+    , price      :: !Ada
+    , unclaimed  :: ![PubKeyHash]
+    , unrevealed :: Integer
     }
   | Finished
   deriving stock (Show, Generic, Prelude.Eq)
@@ -178,13 +175,15 @@ winnerAndPrice auction bids = case AssocMap.toList bids of
   [(bidder, _)] -> (bidder, aMinPrice auction)  -- single participant pays the min price
   _             ->
     let
-      (winner, _)      = getBid . getMaxBid . toPkBidList $ bids
-      (_, secondPrice) = getBid . getMaxBid . toPkBidList $ AssocMap.delete winner bids
+      (winner, _)      = getMaxBid . AssocMap.toList $ bids
+      (_, secondPrice) = getMaxBid . AssocMap.toList $ AssocMap.delete winner bids
     in (winner, secondPrice)
     where
-      toPkBidList = map PkBid . AssocMap.toList
+      getMaxBid (b:bs) = foldl max' b bs
 
-      getMaxBid list = foldr max (head list) (tail list)
+      max' b1@(_, bid1) b2@(_, bid2)
+        | bid1 >= bid2 = b1
+        | otherwise    = b2
 
 
 {-# INLINABLE auctionTransition #-}
@@ -193,7 +192,7 @@ auctionTransition auction State{stateData=oldState, stateValue=currentValue} act
   = case (oldState, action) of
       -- Auction initialization
       (Initializing, Init)
-          -> let constraints = Constraints.mustBeSignedBy (aOwner auction)                <>
+          -> let constraints = Constraints.mustBeSignedBy (aOwner auction) <>
                                Constraints.mustValidateIn (to $ aBidDeadline auction - 1)
              in Just ( constraints
                      , State
@@ -208,7 +207,7 @@ auctionTransition auction State{stateData=oldState, stateValue=currentValue} act
           not (AssocMap.member bidder bids)                           && -- has not given their bid yet
           bidder /= aOwner auction                                       -- auction owner is not taking part in bidding
 
-          -> let constraints = Constraints.mustBeSignedBy bidder                      <>
+          -> let constraints = Constraints.mustBeSignedBy bidder <>
                                Constraints.mustValidateIn (to $ aBidDeadline auction)
              in Just ( constraints
                      , State
@@ -220,8 +219,8 @@ auctionTransition auction State{stateData=oldState, stateValue=currentValue} act
       -- Transition from Bidding to Revealing
       (Collecting sealedBids, b@RevealBid{bid, bidder})
         | validRevealBid sealedBids b (aBsDigits auction) &&  -- bidder has not revelead their bid yet
-          bid >= aMinPrice auction        -- bid is at least as high as minimum price
-          -> let constraints = Constraints.mustBeSignedBy bidder                      <>
+          bid >= aMinPrice auction                            -- bid is at least as high as minimum price
+          -> let constraints = Constraints.mustBeSignedBy bidder <>
                                Constraints.mustValidateIn (interval (aBidDeadline auction + 1) (aRevealDeadline auction))
              in Just ( constraints
                      , State
@@ -235,7 +234,7 @@ auctionTransition auction State{stateData=oldState, stateValue=currentValue} act
         | validRevealBid sealedBids b (aBsDigits auction) &&  -- bidder has not revelead their bid yet
           bid >= aMinPrice auction                            -- bid is at least as high as minimum price
 
-          -> let constraints = Constraints.mustBeSignedBy bidder                         <>
+          -> let constraints = Constraints.mustBeSignedBy bidder <>
                                Constraints.mustValidateIn (to $ aRevealDeadline auction)
              in Just ( constraints
                      , State
@@ -244,14 +243,67 @@ auctionTransition auction State{stateData=oldState, stateValue=currentValue} act
                        }
                      )
 
-      -- Transition from Revealing to Claiming
+      -- Transition from Revealing to Claiming/Finished
       (Revealing sealedBids openBids, Claim bidder)
-        | True
-        -> Nothing
+        | bidder == winner
+          -> let specificConstraints = Constraints.mustPayToPubKey winner (aAsset auction)              <>
+                                       Constraints.mustPayToPubKey (aOwner auction) (Ada.toValue price) <>
+                                       mconcat [ Constraints.mustPayToPubKey bidder' payBack | bidder' <- AssocMap.keys openBids ]
+             in Just ( commonConstraints <> specificConstraints
+                     , State
+                       { stateData  = Finished
+                       , stateValue = Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * unrevealed)
+                       }
+                     )
+
+        | bidder `AssocMap.member` openBids
+          -> let
+               specificConstraints = Constraints.mustPayToPubKey bidder payBack
+             in Just ( commonConstraints <> specificConstraints
+                     , State
+                       { stateData  = Claiming winner price (AssocMap.keys (AssocMap.delete bidder openBids)) unrevealed
+                       , stateValue = currentValue <> inv payBack
+                       }
+                     )
+
+        where
+          unrevealed        = length sealedBids
+          (winner, price)   = winnerAndPrice auction openBids
+          payBack           = Ada.toValue (aLockAmount auction)
+          commonConstraints = Constraints.mustBeSignedBy bidder <>
+                              Constraints.mustValidateIn (interval (aRevealDeadline auction + 1) (aClaimDeadline auction))
 
       -- Claiming
+      (Claiming winner price unclaimed unrevealed, Claim bidder)
+        | bidder == winner
+          -> let specificConstraints = Constraints.mustValidateIn (to $ aClaimDeadline auction)         <>
+                                       Constraints.mustPayToPubKey winner (aAsset auction)              <>
+                                       Constraints.mustPayToPubKey (aOwner auction) (Ada.toValue price) <>
+                                       mconcat [ Constraints.mustPayToPubKey bidder' payBack | bidder' <- unclaimed ]
+             in Just ( commonConstraints <> specificConstraints
+                     , State
+                       { stateData  = Finished
+                       , stateValue = Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * unrevealed)
+                       }
+                     )
 
-      -- Transition from Claiming to Finished
+        | isJust (List.findIndex (bidder ==) unclaimed)
+          -> let
+               specificConstraints = Constraints.mustValidateIn (to $ aClaimDeadline auction) <>
+                                     Constraints.mustPayToPubKey bidder payBack
+             in Just ( commonConstraints <> specificConstraints
+                     , State
+                       { stateData  = Claiming winner price (List.filter (bidder /=) unclaimed) unrevealed
+                       , stateValue = currentValue <> inv payBack
+                       }
+                     )
+
+        | bidder == aOwner auction
+          -> Nothing
+
+        where
+          payBack           = Ada.toValue (aLockAmount auction)
+          commonConstraints = Constraints.mustBeSignedBy bidder
 
       -- Everything Else
       _   -> Nothing
