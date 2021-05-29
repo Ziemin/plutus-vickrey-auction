@@ -10,7 +10,9 @@ License-files:       LICENSE
 
 library
   hs-source-dirs:      src
-  exposed-modules:     Vickrey.Core
+  exposed-modules:     Vickrey.BsDigits
+                     , Vickrey.Core
+                     , Vickrey.Trace 
   build-depends:       aeson
                      , base ^>=4.14.1.0
                      , bytestring >= 0.10.10.0
