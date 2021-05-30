@@ -28,7 +28,7 @@ import           Ledger
 import           Ledger.Ada                 as Ada
 import           Ledger.Value
 import           Plutus.Trace.Emulator      as Emulator
-import           PlutusTx.Prelude
+import           PlutusTx.Prelude           hiding (mapM)
 import           Wallet.Emulator.Wallet
 
 import           Vickrey.Core
@@ -58,7 +58,7 @@ maxParticipants = 10
 auctionTrace :: Wallet -> [(Wallet, Ada, ByteString)] -> EmulatorTrace ()
 auctionTrace owner bidders = do
   Extras.logInfo $ "Starting auction with owner: " ++ show owner ++ " and bidders: " ++ show bidders
-  o <- activateContractWallet owner endpoints
+  o <- activateContractWallet owner ownerEndpoints
   let pkhOwner = pubKeyHash $ walletPubKey owner
       op = OwnerParams
           { opAsset               = auctionAsset
@@ -72,23 +72,30 @@ auctionTrace owner bidders = do
           , opThreadTokenName     = threadAssetTokenName
           }
 
-      callBidder (w, bid, nonce) = do
-        h <- activateContractWallet w endpoints
-        let bp = BidderParams
-              { bdOwner       = pkhOwner
-              , bdOwnerParams = op
-              , bdBid         = bid
-              , bdNonce       = nonce
-              }
-        callEndpoint @"makeBid" h bp
+      getEndpoint (w, bid, nonce) = activateContractWallet w (bidderEndpoints bp)
+        where bp = BidderParams
+                { bdOwner       = pkhOwner
+                , bdOwnerParams = op
+                , bdBid         = bid
+                , bdNonce       = nonce
+                }
 
-  callEndpoint @"runAuction" o op
+      placeBidAndWait h = callEndpoint @"place bid" h () >> void (Emulator.waitNSlots 1)
+      revealBidAndWait h = callEndpoint @"reveal bid" h () >> void (Emulator.waitNSlots 1)
+      claimAndWait h = callEndpoint @"claim" h () >> void (Emulator.waitNSlots 1)
 
-  void $ Emulator.waitNSlots 3
+  hs <- mapM getEndpoint bidders
 
-  mapM_ callBidder bidders
+  callEndpoint @"run auction" o op
+  void $ Emulator.waitNSlots 2
 
-  void $ Emulator.waitUntilSlot (opClaimDeadline op + 10)
+  mapM_ placeBidAndWait hs
+
+  void $ Emulator.waitUntilSlot (opBidDeadline op + 1)
+  mapM_ revealBidAndWait hs
+
+  void $ Emulator.waitUntilSlot (opRevealDeadline op + 1)
+  mapM_ claimAndWait hs
 
 
 test' :: Wallet -> [(Wallet, Ada, ByteString)] -> IO ()
@@ -110,4 +117,5 @@ test = do
                    , (Wallet 3, 3000, "Secret")
                    , (Wallet 4, 2500, "Word")
                    , (Wallet 5, 2700, "Random")
+                   , (Wallet 6, 700, "Stupid")
                    ]

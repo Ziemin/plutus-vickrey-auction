@@ -24,8 +24,9 @@ module Vickrey.Core (
   AuctionAction(..),
   OwnerParams(..),
   BidderParams(..),
-  AuctionSchema,
-  endpoints
+  ownerEndpoints,
+  bidderEndpoints,
+  bidderConvenientEndpoints
   ) where
 
 import           Control.Monad                hiding (fmap)
@@ -453,6 +454,13 @@ runAuction op = do
                 "Auction is finished. The winner " ++ show winner ++ " paid " ++ show price ++ "Ada."
 
 
+type OwnerSchema = BlockchainActions
+  .\/ Endpoint "run auction" OwnerParams
+
+ownerEndpoints :: Contract () OwnerSchema Text ()
+ownerEndpoints = (endpoint @"run auction" >>= runAuction) >> ownerEndpoints
+
+
 data BidderParams = BidderParams
     { bdOwner       :: !PubKeyHash
     , bdOwnerParams :: !OwnerParams
@@ -460,6 +468,53 @@ data BidderParams = BidderParams
     , bdNonce       :: !ByteString
     } deriving (Show, Generic, FromJSON, ToJSON, ToSchema)
 
+
+placeBid :: forall w s. HasBlockchainActions s => BidderParams -> () -> Contract w s Text ()
+placeBid bp () = do
+  pkh <- pubKeyHash <$> Contract.ownPubKey
+  let auction   = mkAuctionParams (bdOwnerParams bp) (bdOwner bp)
+      client    = auctionClient auction
+      bid       = bdBid bp
+      nonce     = bdNonce bp
+      sealedBid = encodeBid bid nonce (aBsDigits auction)
+  logInfo @String "Placing sealed bid"
+  void $ mapError' $ runStep client (PlaceBid sealedBid pkh)
+
+
+revealBid :: forall w s. HasBlockchainActions s => BidderParams -> () -> Contract w s Text ()
+revealBid bp () = do
+  pkh <- pubKeyHash <$> Contract.ownPubKey
+  let auction   = mkAuctionParams (bdOwnerParams bp) (bdOwner bp)
+      bid       = bdBid bp
+      nonce     = bdNonce bp
+      client    = auctionClient auction
+  logInfo @String "Revealing bid"
+  void $ mapError' $ runStep client (RevealBid bid pkh nonce)
+
+
+bidderClaim :: forall w s. HasBlockchainActions s => BidderParams -> () -> Contract w s Text ()
+bidderClaim bp () = do
+  pkh <- pubKeyHash <$> Contract.ownPubKey
+  let auction   = mkAuctionParams (bdOwnerParams bp) (bdOwner bp)
+      client    = auctionClient auction
+  logInfo @String "Claiming"
+  void $ mapError' $ runStep client (Claim pkh)
+
+
+type BidderSchema = BlockchainActions
+  .\/ Endpoint "place bid" ()
+  .\/ Endpoint "reveal bid" ()
+  .\/ Endpoint "claim" ()
+
+bidderEndpoints :: BidderParams -> Contract () BidderSchema Text ()
+bidderEndpoints bp = (placeBid' `select` revealBid' `select` claim') >> bidderEndpoints bp
+  where
+    placeBid'  = handleError logError $ endpoint @"place bid"  >>= placeBid bp
+    revealBid' = handleError logError $ endpoint @"reveal bid" >>= revealBid bp
+    claim'     = handleError logError $ endpoint @"claim"      >>= bidderClaim bp
+
+
+-- TODO: endpoints below require better error handling
 
 performBidding ::
   forall w s. HasBlockchainActions s =>
@@ -515,13 +570,8 @@ makeBid bp = do
     Just _ -> performBidding client bp auction
 
 
-type AuctionSchema = BlockchainActions
-  .\/ Endpoint "runAuction" OwnerParams
-  .\/ Endpoint "makeBid" BidderParams
+type BidderConvenientSchema = BlockchainActions
+  .\/ Endpoint "make bid" BidderParams
 
-
-endpoints :: Contract () AuctionSchema Text ()
-endpoints = (run `select` bid) >> endpoints
-  where
-    run = endpoint @"runAuction" >>= runAuction
-    bid = endpoint @"makeBid" >>= makeBid
+bidderConvenientEndpoints :: Contract () BidderConvenientSchema Text ()
+bidderConvenientEndpoints = (endpoint @"make bid" >>= makeBid) >> bidderConvenientEndpoints
