@@ -135,34 +135,38 @@ winnerAndPrice auction bids = case AssocMap.toList bids of
 
 {-# INLINABLE auctionTransition #-}
 auctionTransition :: AuctionParams -> State AuctionState -> AuctionAction -> Maybe (TxConstraints Void Void, State AuctionState)
-auctionTransition auction State{stateData=oldState, stateValue=currentValue} action
-  = case (oldState, action) of
+auctionTransition auction State{stateData=oldState} action = case (oldState, action) of
       -- Bidding
       (Collecting bids, PlaceBid{sealedBid, bidder})
         | length (AssocMap.toList bids) < aMaxNumParticipants auction && -- is there a place for new bidders
           not (AssocMap.member bidder bids)                           && -- has not given their bid yet
           bidder /= aOwner auction                                       -- auction owner is not taking part in bidding
 
-          -> let constraints = Constraints.mustBeSignedBy bidder                      <>
-                               Constraints.mustValidateIn (to $ aBidDeadline auction)
+          -> let constraints =
+                   Constraints.mustBeSignedBy bidder
+                   <> Constraints.mustValidateIn (to $ aBidDeadline auction) -- bids have to be places before the bidding deadline
              in Just ( constraints
                      , State
-                       { stateData = Collecting (AssocMap.insert bidder sealedBid bids)
-                       , stateValue = currentValue <> Ada.toValue (aLockAmount auction)
+                       { stateData = Collecting (AssocMap.insert bidder sealedBid bids) -- add valid bidinto sealed bids
+                       , stateValue = aAsset auction
+                                      <> Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * length bids) -- other bidder have locked their funds
+                                      <> Ada.toValue (aLockAmount auction) -- bidder has to lock certain amount in the script to participate
                        }
                     )
 
       -- Transition from Bidding to Revealing
       (Collecting sealedBids, b@RevealBid{bid, bidder})
-        | validRevealBid sealedBids b (aBsDigits auction) &&  -- bidder has not revelead their bid yet
-          bid >= aMinPrice auction                            -- bid is at least as high as minimum price
+        | validRevealBid sealedBids b (aBsDigits auction) && -- bidder has not revelead their bid yet and their bid was properly encoded
+          bid >= aMinPrice auction                           -- bid is at least as high as minimum price
 
-          -> let constraints = Constraints.mustBeSignedBy bidder <>
-                               Constraints.mustValidateIn (interval (aBidDeadline auction + 1) (aRevealDeadline auction))
+          -> let constraints =
+                   Constraints.mustBeSignedBy bidder <>
+                   Constraints.mustValidateIn (interval (aBidDeadline auction + 1) (aRevealDeadline auction)) -- revealing happens in the revealing period
              in Just ( constraints
                      , State
-                       { stateData = Revealing (AssocMap.delete bidder sealedBids) (AssocMap.singleton bidder bid)
-                       , stateValue = currentValue
+                       { stateData = Revealing (AssocMap.delete bidder sealedBids) (AssocMap.singleton bidder bid) -- the bid is moved to open bids
+                       , stateValue = aAsset auction
+                                      <> Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * length sealedBids)
                        }
                     )
 
@@ -170,62 +174,86 @@ auctionTransition auction State{stateData=oldState, stateValue=currentValue} act
       (Collecting bids, Claim bidder)
         | bidder == aOwner auction
 
-          -> let constraints = Constraints.mustBeSignedBy bidder                             <>
-                               Constraints.mustPayToPubKey (aOwner auction) (aAsset auction) <>
-                               Constraints.mustValidateIn (
-                                    if null bids then
-                                      from $ aBidDeadline auction + 1
-                                    else
-                                      from $ aRevealDeadline auction + 1
-                               )
+          -> let constraints =
+                   Constraints.mustBeSignedBy bidder
+                   <> Constraints.mustPayToPubKey (aOwner auction) (aAsset auction) -- owner gets their asset back
+                   <> Constraints.mustValidateIn (
+                        if null bids then
+                          from $ aBidDeadline auction + 1 -- when there are no bidders the owner can claim their assets earlier
+                        else
+                          from $ aRevealDeadline auction + 1 -- otherwise it can only happen after the revelations
+                        )
              in Just ( constraints
                      , State
                        { stateData = Finished (aOwner auction) 0
-                       , stateValue = Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * length bids)
+                       , stateValue = Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * length bids) -- bidder who do not reveal their bids on time lose their locked assets forever
                        }
                     )
 
       -- Revealing bids
       (Revealing sealedBids openBids, b@RevealBid{bid, bidder})
-        | validRevealBid sealedBids b (aBsDigits auction) &&  -- bidder has not revelead their bid yet
-          bid >= aMinPrice auction                            -- bid is at least as high as minimum price
+        | validRevealBid sealedBids b (aBsDigits auction) &&  -- bidder has not revelead their bid yet and their bid was properly encoded
+          bid >= aMinPrice auction                            -- bid is at least as high as the minimum price
 
-          -> let constraints = Constraints.mustBeSignedBy bidder <>
-                               Constraints.mustValidateIn (to $ aRevealDeadline auction)
+          -> let constraints =
+                   Constraints.mustBeSignedBy bidder
+                   <> Constraints.mustValidateIn (to $ aRevealDeadline auction)  -- revealing has to happen before the deadline
              in Just ( constraints
                      , State
-                       { stateData = Revealing (AssocMap.delete bidder sealedBids) (AssocMap.insert bidder bid openBids)
-                       , stateValue = currentValue
+                       { stateData = Revealing (AssocMap.delete bidder sealedBids) (AssocMap.insert bidder bid openBids) -- move the bidder to open bids
+                       , stateValue = aAsset auction
+                                      <> Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * (length sealedBids + length openBids))
                        }
                      )
 
       -- Transition from Revealing to Claiming/Finished
       (Revealing sealedBids openBids, Claim bidder)
+        -- winner is retrieving the asset
         | bidder == winner
-          -> let specificConstraints = Constraints.mustPayToPubKey winner (aAsset auction)              <>
-                                       Constraints.mustPayToPubKey (aOwner auction) (Ada.toValue price) <>
-                                       mconcat [ Constraints.mustPayToPubKey bidder' payBack
-                                               | bidder' <- AssocMap.keys openBids
-                                               ]
+          -> let specificConstraints =
+                   Constraints.mustPayToPubKey winner (aAsset auction)  -- winner is getting the asset
+                   <> Constraints.mustPayToPubKey (aOwner auction) (Ada.toValue price) -- auction owner is paid the asset price
+                   <> mconcat [ Constraints.mustPayToPubKey bidder' payBack  -- bidders who revealed their bids are getting their locked funds back
+                              | bidder' <- AssocMap.keys openBids
+                              ]
              in Just ( commonConstraints <> specificConstraints
                      , State
                        { stateData  = Finished winner price
+                       , stateValue = Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * unrevealed) -- bidders who do not reveal their bids lose their locked funds forever
+                       }
+                     )
+
+        -- 'loser' is getting their locked funds back
+        | bidder `AssocMap.member` openBids
+          -> let
+               specificConstraints =
+                 mconcat [ Constraints.mustPayToPubKey bidder' payBack -- all of the 'losers' are getting their locked funds back
+                         | bidder' <- AssocMap.keys openBids
+                         , bidder' /= winner -- the winner still has to pay for the asset
+                         ]
+             in Just ( commonConstraints <> specificConstraints
+                     , State
+                       { stateData  = Claiming winner price [winner] unrevealed
+                       , stateValue = aAsset auction
+                                      <> Ada.toValue (aLockAmount auction) -- winner's funds are locked
+                                      <> Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * unrevealed)
+                       }
+                     )
+
+        -- winner has not claimed the asset
+        | bidder == aOwner auction
+          -> let specificConstraints =
+                   Constraints.mustPayToPubKey (aOwner auction) (aAsset auction)
+                   <> Constraints.mustValidateIn (from $ aClaimDeadline auction + 1) -- after the deadline the owner is retrieving their assets
+                   <> mconcat [ Constraints.mustPayToPubKey bidder' payBack -- bidder who revelaed their choices get their funds back
+                              | bidder' <- AssocMap.keys openBids]
+             in Just ( commonConstraints <> specificConstraints
+                     , State
+                       { stateData = Finished (aOwner auction) 0  -- the final winner is the owner
                        , stateValue = Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * unrevealed)
                        }
                      )
 
-        | bidder `AssocMap.member` openBids
-          -> let
-               specificConstraints = mconcat [ Constraints.mustPayToPubKey bidder' payBack
-                                             | bidder' <- AssocMap.keys openBids
-                                             , bidder' /= winner
-                                             ]
-             in Just ( commonConstraints <> specificConstraints
-                     , State
-                       { stateData  = Claiming winner price (AssocMap.keys (AssocMap.delete bidder openBids)) unrevealed
-                       , stateValue = currentValue <> inv payBack
-                       }
-                     )
 
         where
           unrevealed        = length sealedBids
@@ -236,44 +264,55 @@ auctionTransition auction State{stateData=oldState, stateValue=currentValue} act
 
       -- Claiming
       (Claiming winner price unclaimed unrevealed, Claim bidder)
+        -- winner is retrieving the asset
         | bidder == winner
-          -> let specificConstraints = Constraints.mustPayToPubKey winner (aAsset auction)                            <>
-                                       Constraints.mustPayToPubKey (aOwner auction) (Ada.toValue price)               <>
-                                       mconcat [ Constraints.mustPayToPubKey bidder' payBack
-                                               | bidder' <- unclaimed ]                                               <>
-                                       Constraints.mustValidateIn (
-                                         if bidder == aOwner auction then
-                                           always
-                                         else
-                                           to $ aClaimDeadline auction
-                                       )
+          -> let specificConstraints =
+                   Constraints.mustPayToPubKey winner (aAsset auction)  -- winner gets the asset
+                   <> Constraints.mustPayToPubKey (aOwner auction) (Ada.toValue price) -- owner is paid the price
+                   <> mconcat [ Constraints.mustPayToPubKey bidder' payBack -- 'losers' get their locked funds back
+                              | bidder' <- unclaimed
+                              ]
+                   <> Constraints.mustValidateIn (
+                        if bidder == aOwner auction then
+                          always -- there is actually no winner the the moment of claiming, so the owner is retrieving their funds back at any time
+                        else
+                          to $ aClaimDeadline auction  -- otherwise the 'real' winner has to claim the asset before the deadline
+                        )
              in Just ( commonConstraints <> specificConstraints
                      , State
                        { stateData  = Finished winner price
-                       , stateValue = Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * unrevealed)
+                       , stateValue = Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * unrevealed) -- the funds of unrevealed bids stay locked forever
                        }
                      )
 
+        -- 'loser' is getting their locked funds back
         | isJust (List.findIndex (bidder ==) unclaimed)
           -> let
-               specificConstraints = Constraints.mustValidateIn (to $ aClaimDeadline auction) <>
-                                     mconcat [ Constraints.mustPayToPubKey bidder' payBack
-                                             | bidder' <- unclaimed
-                                             , bidder' /= winner ]
+               specificConstraints =
+                 Constraints.mustValidateIn (to $ aClaimDeadline auction)
+                 <> mconcat [ Constraints.mustPayToPubKey bidder' payBack  -- all the 'losers' are getting back their locked funds
+                            | bidder' <- unclaimed
+                            , bidder' /= winner -- winner has to pay for the asset
+                            ]
              in Just ( commonConstraints <> specificConstraints
                      , State
-                       { stateData  = Claiming winner price (List.filter (bidder /=) unclaimed) unrevealed
-                       , stateValue = currentValue <> inv payBack
+                       { stateData  = Claiming winner price [winner] unrevealed -- the winner still has to pay for the asset
+                       , stateValue = aAsset auction
+                                      <> Ada.toValue (aLockAmount auction) -- winner's funds are locked
+                                      <> Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * unrevealed)
                        }
                      )
 
+        -- winner has not claimed the asset
         | bidder == aOwner auction
-          -> let specificConstraints = Constraints.mustPayToPubKey (aOwner auction) (aAsset auction) <>
-                                       mconcat [ Constraints.mustPayToPubKey bidder' payBack
-                                               | bidder' <- unclaimed ]
+          -> let specificConstraints =
+                   Constraints.mustPayToPubKey (aOwner auction) (aAsset auction)
+                   <> Constraints.mustValidateIn (from $ aClaimDeadline auction + 1) -- after the deadline the owner is retrieving their assets
+                   <> mconcat [ Constraints.mustPayToPubKey bidder' payBack -- bidder who revelaed their choices get their funds back
+                              | bidder' <- unclaimed ]
              in Just ( commonConstraints <> specificConstraints
                      , State
-                       { stateData = Finished winner price
+                       { stateData = Finished (aOwner auction) 0  -- the final winner is the owner
                        , stateValue = Ada.lovelaceValueOf (getLovelace (aLockAmount auction) * unrevealed)
                        }
                      )
@@ -285,26 +324,15 @@ auctionTransition auction State{stateData=oldState, stateValue=currentValue} act
       -- Everything Else
       _   -> Nothing
 
-
-{-# INLINABLE isFinal #-}
-isFinal :: AuctionState -> Bool
-isFinal Finished {} = True
-isFinal _           = False
-
-{-# INLINABLE checkStateAndAction #-}
-checkStateAndAction :: AuctionState -> AuctionAction -> ScriptContext -> Bool
-checkStateAndAction _ _ _ = True
-
 type AuctionStateMachine = StateMachine AuctionState AuctionAction
 
 {-# INLINABLE auctionStateMachine #-}
 auctionStateMachine :: AuctionParams -> AuctionStateMachine
-auctionStateMachine auction = StateMachine
-    { smTransition  = auctionTransition auction
-    , smFinal       = isFinal
-    , smCheck       = checkStateAndAction
-    , smThreadToken = Just $ aThreadToken auction
-    }
+auctionStateMachine auction
+  = mkStateMachine (Just $ aThreadToken auction) (auctionTransition auction) isFinal
+  where
+    isFinal :: AuctionState -> Bool
+    isFinal = const False
 
 {-# INLINABLE mkAuctionValidator #-}
 mkAuctionValidator :: AuctionParams -> AuctionState -> AuctionAction -> ScriptContext -> Bool

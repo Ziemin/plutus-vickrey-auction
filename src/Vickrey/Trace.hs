@@ -47,10 +47,9 @@ threadAssetCurrency = "dd"
 
 threadAssetTokenName :: TokenName
 threadAssetTokenName = "THREAD_TOKEN"
-threadAsset = assetClassValue (AssetClass (threadAssetCurrency, threadAssetTokenName)) 1
 
 threadAsset :: Value
-
+threadAsset = assetClassValue (AssetClass (threadAssetCurrency, threadAssetTokenName)) 1
 
 maxParticipants :: Integer
 maxParticipants = 10
@@ -105,6 +104,8 @@ test' owner bidders = runEmulatorTraceIO' def emCfg $ auctionTrace owner bidders
 test :: IO ()
 test = do
   test' (Wallet 1) []
+  test' (Wallet 1) [ (Wallet 2, 500, "Something")
+                   ]
   test' (Wallet 1) [ (Wallet 2, 2000, "Something")
                    , (Wallet 3, 3000, "Secret")
                    , (Wallet 4, 2500, "Word")
